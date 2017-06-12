@@ -13,6 +13,7 @@ namespace Symfony\Flex;
 
 use Composer\Cache;
 use Composer\Composer;
+use Composer\DependencyResolver\Operation\OperationInterface;
 use Composer\Downloader\TransportException;
 use Composer\Factory;
 use Composer\IO\IOInterface;
@@ -64,19 +65,82 @@ class Downloader
     }
 
     /**
+     * Downloads recipes.
+     *
+     * @param OperationInterface[] $operations
+     *
+     * @return Recipe[]
+     */
+    public function getRecipes(array $operations)
+    {
+        $max = 1000;
+        $urls = [];
+        $chunk = '';
+        foreach ($operations as $i => $operation) {
+            if ($operation instanceof UpdateOperation) {
+                $package = $operation->getTargetPackage();
+            } else {
+                $package = $operation->getPackage();
+            }
+
+            $version = $package->getPrettyVersion();
+            if (0 === strpos($version, 'dev-') && isset($package->getExtra()['branch-alias'])) {
+                $branchAliases = $package->getExtra()['branch-alias'];
+                if (($alias = $branchAliases[$version]) || ($alias = $branchAliases['dev-master'])) {
+                    $version = $alias;
+                }
+            }
+            $o = 'i';
+            if ('uninstall' === $operation->getJobType()) {
+                $o = 'r';
+            } elseif ('update' === $operation->getJobType()) {
+                $o = 'u';
+            }
+
+            // FIXME: getNames() can return n names
+            $name = str_replace('/', ',', $package->getNames()[0]);
+            $url = sprintf('%s,%s%s', $name, $o, $version);
+            if ($date = $package->getReleaseDate()) {
+                $url .= ','.$date->format('U');
+            }
+            if (strlen($chunk) + strlen($url) > 1000) {
+                $urls[] = '/p/'.$chunk;
+                $chunk = '';
+            } elseif ($chunk) {
+                $chunk .= ';'.$url;
+            } else {
+                $chunk = $url;
+            }
+        }
+        if ($chunk) {
+            $urls[] = '/p/'.$chunk;
+        }
+
+        $data = [];
+        foreach ($urls as $url) {
+            $response = $this->get($url, ['Package-Session: '.$this->sess], false);
+            foreach ($response->getBody() as $name => $manifest) {
+                $data[$name] = $manifest;
+            }
+        }
+
+        return $data;
+    }
+
+    /**
      * Decodes a JSON HTTP response body.
      *
      * @param string $path    The path to get on the server
      * @param array  $headers An array of HTTP headers
      */
-    public function get(string $path, array $headers = []): Response
+    public function get(string $path, array $headers = [], $cache = true): Response
     {
         $headers[] = 'Package-Session: '.$this->sess;
         $url = $this->endpoint.'/'.ltrim($path, '/');
-        $cacheKey = ltrim($path, '/');
+        $cacheKey = $cache ? ltrim($path, '/') : '';
 
         try {
-            if ($contents = $this->cache->read($cacheKey)) {
+            if ($cacheKey && $contents = $this->cache->read($cacheKey)) {
                 $cachedResponse = Response::fromJson(json_decode($contents, true));
                 if ($lastModified = $cachedResponse->getHeader('last-modified')) {
                     $response = $this->fetchFileIfLastModified($url, $cacheKey, $lastModified, $headers);
@@ -117,7 +181,7 @@ class Downloader
                     continue;
                 }
 
-                if ($contents = $this->cache->read($cacheKey)) {
+                if ($cacheKey && $contents = $this->cache->read($cacheKey)) {
                     $this->switchToDegradedMode($e, $url);
 
                     return Response::fromJson(JsonFile::parseJson($contents, $this->cache->getRoot().$cacheKey));

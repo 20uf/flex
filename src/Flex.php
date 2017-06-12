@@ -15,6 +15,7 @@ use Composer\Command\CreateProjectCommand;
 use Composer\Command\InstallCommand;
 use Composer\Composer;
 use Composer\Console\Application;
+use Composer\DependencyResolver\Operation\UpdateOperation;
 use Composer\Factory;
 use Composer\EventDispatcher\EventSubscriberInterface;
 use Composer\Installer;
@@ -44,6 +45,7 @@ class Flex implements PluginInterface, EventSubscriberInterface
     private $downloader;
     private $postInstallOutput = [''];
     private $runningCommand;
+    private $operations = [];
     private static $activated = true;
 
     public function activate(Composer $composer, IOInterface $io)
@@ -115,49 +117,9 @@ class Flex implements PluginInterface, EventSubscriberInterface
         file_put_contents($json->getPath(), $manipulator->getContents());
     }
 
-    public function configurePackage(PackageEvent $event): void
+    public function recordOperation(PackageEvent $event): void
     {
-        if (($this->runningCommand)() instanceof InstallCommand) {
-            return;
-        }
-
-        $package = $event->getOperation()->getPackage();
-        foreach ($this->filterPackageNames($package, 'install') as $recipe) {
-            $this->io->write(sprintf('    Auto-configuring from %s', $recipe->getOrigin()));
-            $this->configurator->install($recipe);
-
-            $manifest = $recipe->getManifest();
-            if (isset($manifest['post-install-output'])) {
-                foreach ($manifest['post-install-output'] as $line) {
-                    $this->postInstallOutput[] = $this->options->expandTargetDir($line);
-                }
-                $this->postInstallOutput[] = '';
-            }
-        }
-    }
-
-    public function reconfigurePackage(PackageEvent $event): void
-    {
-        if (($this->runningCommand)() instanceof InstallCommand) {
-            return;
-        }
-
-        $package = $event->getOperation()->getTargetPackage();
-        // called for the side effect of checking security issues
-        $this->filterPackageNames($package, 'update');
-    }
-
-    public function unconfigurePackage(PackageEvent $event): void
-    {
-        if (($this->runningCommand)() instanceof InstallCommand) {
-            return;
-        }
-
-        $package = $event->getOperation()->getPackage();
-        foreach ($this->filterPackageNames($package, 'uninstall') as $recipe) {
-            $this->io->write(sprintf('    Auto-unconfiguring from %s', $recipe->getOrigin()));
-            $this->configurator->unconfigure($recipe);
-        }
+        $this->operations[] = $event->getOperation();
     }
 
     public function postInstall(Event $event): void
@@ -178,6 +140,49 @@ class Flex implements PluginInterface, EventSubscriberInterface
         if (!file_exists(getcwd().'/.env') && file_exists(getcwd().'/.env.dist')) {
             copy(getcwd().'/.env.dist', getcwd().'/.env');
         }
+
+        list($recipes, $vulnerabilities) = $this->fetchRecipes();
+        if ($vulnerabilities) {
+            $this->io->write(sprintf('<info>Vulnerabilities: %d package%s</>', count($vulnerabilities), count($recipes) > 1 ? 's' : ''));
+        }
+        foreach ($vulnerabilities as $name => $vulns) {
+            foreach ($vulns as $v) {
+                $this->io->write(sprintf('  - <error>Vulnerability on %s</>: %s', $name, $v));
+            }
+        }
+
+        if (!$recipes) {
+            return;
+        }
+
+        $this->io->write(sprintf('<info>Symfony operations: %d recipe%s</>', count($recipes), count($recipes) > 1 ? 's' : ''));
+        foreach ($recipes as $recipe) {
+            if ($recipe->isNotInstallable() && $recipe->isEmpty()) {
+                $this->io->write(sprintf('  - <warning>Ignoring</> recipe %s', $this->formatOrigin($recipe->getOrigin())));
+                $this->io->write('    Enable via composer config extra.symfony.allow-contrib true');
+                continue;
+            }
+
+            switch ($recipe->getJob()) {
+                case 'install':
+                    $this->io->write(sprintf('  - Configuring %s', $this->formatOrigin($recipe->getOrigin())));
+                    $this->configurator->install($recipe);
+                    $manifest = $recipe->getManifest();
+                    if (isset($manifest['post-install-output'])) {
+                        foreach ($manifest['post-install-output'] as $line) {
+                            $this->postInstallOutput[] = $this->options->expandTargetDir($line);
+                        }
+                        $this->postInstallOutput[] = '';
+                    }
+                    break;
+                case 'update':
+                    break;
+                case 'uninstall':
+                    $this->io->write(sprintf('  - Unconfiguring %s', $this->formatOrigin($recipe->getOrigin())));
+                    $this->configurator->unconfigure($recipe);
+                    break;
+            }
+        }
     }
 
     public function executeAutoScripts(Event $event): void
@@ -196,40 +201,42 @@ class Flex implements PluginInterface, EventSubscriberInterface
         $this->io->write($this->postInstallOutput);
     }
 
-    private function filterPackageNames(PackageInterface $package, string $operation): \Generator
+    private function fetchRecipes(): array
     {
-        // FIXME: getNames() can return n names
-        $name = $package->getNames()[0];
-        $response = $this->getPackageRecipe($package, $name, $operation);
-
-        if (('install' === $operation || 'update' === $operation) && $values = $response->getHeaders('Security-Adv')) {
-            $this->io->writeError('    <error>  Package has known vulnerabilities  </>');
-            foreach ($values as $value) {
-                $this->io->writeError(sprintf('      %s', $value));
+        $data = $this->downloader->getRecipes($this->operations);
+        $manifests = $data['manifests'] ?? [];
+        $recipes = [];
+        foreach ($this->operations as $i => $operation) {
+            if ($operation instanceof UpdateOperation) {
+                $package = $operation->getTargetPackage();
+            } else {
+                $package = $operation->getPackage();
             }
-        }
 
-        $statusCode = $response->getStatusCode();
-        $origin = $response->getHeader('Symfony-Recipe');
+            // FIXME: getNames() can return n names
+            $name = $package->getNames()[0];
+            $job = $operation->getJobType();
 
-        if (200 === $statusCode || 304 === $statusCode) {
-            yield $name => new Recipe($package, $name, $response->getBody(), $origin);
-        } else {
-            if ($origin) {
-                $this->io->write(sprintf('    <warning>Ignored auto-configuration from %s</>', $origin));
-                $this->io->write('    <warning>Enable via composer config extra.symfony.allow-contrib true</>');
+            if (isset($manifests[$name])) {
+                $recipes[] = new Recipe($package, $name, $job, $manifests[$name]);
             }
-            if ('symfony-bundle' === $package->getType()) {
+
+            $noRecipe = !isset($manifests[$name]) || (isset($manifests[$name]['not_installable']) && $manifests[$name]['not_installable']);
+            if ($noRecipe && 'symfony-bundle' === $package->getType()) {
                 $manifest = [];
-                $bundle = new SymfonyBundle($this->composer, $package, $operation);
+                $bundle = new SymfonyBundle($this->composer, $package, $job);
                 foreach ($bundle->getClassNames() as $class) {
                     $manifest['manifest']['bundles'][$class] = ['all'];
                 }
                 if ($manifest) {
-                    yield $name => new Recipe($package, $name, $manifest, 'auto-generated recipe');
+                    $manifest['origin'] = sprintf('%s:%s@auto-generated recipe', $name, $package->getPrettyVersion());
+                    $recipes[] = new Recipe($package, $name, $job, $manifest);
                 }
             }
         }
+        $this->operations = [];
+
+        return [$recipes, $data['vulnerabilities'] ?? []];
     }
 
     private function initOptions(): Options
@@ -290,6 +297,16 @@ class Flex implements PluginInterface, EventSubscriberInterface
         return $id;
     }
 
+    private function formatOrigin(string $origin): string
+    {
+        // symfony/translation:3.3@github.com/symfony/recipes:master
+        if (!preg_match('/^([^\:]+?)\:([^\@]+)@(.+)$/', $origin, $matches)) {
+            return $origin;
+        }
+
+        return sprintf('<info>%s</> (<comment>%s</>): From %s', $matches[1], $matches[2], 'auto-generated recipe' === $matches[3] ? '<comment>'.$matches[3].'</>' : $matches[3]);
+    }
+
     public static function getSubscribedEvents(): iterable
     {
         if (!self::$activated) {
@@ -297,9 +314,9 @@ class Flex implements PluginInterface, EventSubscriberInterface
         }
 
         return [
-            PackageEvents::POST_PACKAGE_INSTALL => 'configurePackage',
-            PackageEvents::POST_PACKAGE_UPDATE => 'reconfigurePackage',
-            PackageEvents::POST_PACKAGE_UNINSTALL => 'unconfigurePackage',
+            PackageEvents::POST_PACKAGE_INSTALL => 'recordOperation',
+            PackageEvents::POST_PACKAGE_UPDATE => 'recordOperation',
+            PackageEvents::POST_PACKAGE_UNINSTALL => 'recordOperation',
             ScriptEvents::POST_CREATE_PROJECT_CMD => 'configureProject',
             ScriptEvents::POST_INSTALL_CMD => 'postInstall',
             ScriptEvents::POST_UPDATE_CMD => 'postUpdate',
